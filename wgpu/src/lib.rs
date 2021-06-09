@@ -379,6 +379,22 @@ trait Context: Debug + Send + Sized + Sync {
         copy_size: Extent3d,
     );
 
+    fn command_encoder_copy_swap_chain_texture_to_texture(
+        &self,
+        encoder: &Self::CommandEncoderId,
+        source: ImageCopySwapChainTexture,
+        destination: ImageCopyTexture,
+        copy_size: Extent3d,
+    );
+
+    fn command_encoder_copy_texture_to_swap_chain_texture(
+        &self,
+        encoder: &Self::CommandEncoderId,
+        source: ImageCopyTexture,
+        destination: ImageCopySwapChainTexture,
+        copy_size: Extent3d,
+    );
+
     fn command_encoder_begin_compute_pass(
         &self,
         encoder: &Self::CommandEncoderId,
@@ -1291,6 +1307,9 @@ pub use wgt::ImageCopyTexture as ImageCopyTextureBase;
 /// View of a texture which can be used to copy to/from a buffer/texture.
 pub type ImageCopyTexture<'a> = ImageCopyTextureBase<&'a Texture>;
 
+/// View of a swap chain texture which can be used to copy to/from a buffer/texture.
+pub type ImageCopySwapChainTexture<'a> = ImageCopyTextureBase<&'a SwapChainTexture>;
+
 /// Describes a [`BindGroupLayout`].
 #[derive(Clone, Debug)]
 pub struct BindGroupLayoutDescriptor<'a> {
@@ -2117,6 +2136,52 @@ impl CommandEncoder {
         copy_size: Extent3d,
     ) {
         Context::command_encoder_copy_texture_to_texture(
+            &*self.context,
+            self.id.as_ref().unwrap(),
+            source,
+            destination,
+            copy_size,
+        );
+    }
+
+    /// Copy data from one texture to a swapchain texture.
+    ///
+    /// # Panics
+    ///
+    /// - Destination is not a swapchain texture
+    /// - Textures are not the same type
+    /// - If a depth texture, or a multisampled texture, the entire texture must be copied
+    /// - Copy would overrun either texture
+    pub fn copy_texture_to_swap_chain_texture(
+        &mut self,
+        source: ImageCopyTexture,
+        destination: ImageCopySwapChainTexture,
+        copy_size: Extent3d,
+    ) {
+        Context::command_encoder_copy_texture_to_swap_chain_texture(
+            &*self.context,
+            self.id.as_ref().unwrap(),
+            source,
+            destination,
+            copy_size,
+        );
+    }
+
+    /// Copy data from one texture to a swapchain texture.
+    ///
+    /// # Panics
+    ///
+    /// - Source is not a swapchain texture
+    /// - Textures are not the same type
+    /// - If a depth texture, or a multisampled texture, the entire texture must be copied
+    /// - Copy would overrun either texture
+    pub fn copy_swap_chain_texture_to_texture(
+        &mut self,
+        source: ImageCopySwapChainTexture,
+        destination: ImageCopyTexture,
+        copy_size: Extent3d,
+    ) {
+        Context::command_encoder_copy_swap_chain_texture_to_texture(
             &*self.context,
             self.id.as_ref().unwrap(),
             source,

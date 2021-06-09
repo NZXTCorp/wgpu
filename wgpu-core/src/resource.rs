@@ -325,6 +325,15 @@ pub struct TextureView<B: hal::Backend> {
     pub(crate) life_guard: LifeGuard,
 }
 
+impl<B: hal::Backend> TextureView<B> {
+    pub(crate) fn get_swapchain_image(&self) -> Option<&B::Image> {
+        match &self.inner {
+            TextureViewInner::SwapChain { image, ..} => Some(image.borrow()),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Error)]
 pub enum CreateTextureViewError {
     #[error("parent texture is invalid or destroyed")]

@@ -1639,6 +1639,50 @@ impl crate::Context for Context {
         }
     }
 
+    fn command_encoder_copy_swap_chain_texture_to_texture(
+        &self,
+        encoder: &Self::CommandEncoderId,
+        source: crate::ImageCopySwapChainTexture,
+        destination: crate::ImageCopyTexture,
+        copy_size: wgt::Extent3d,
+    ) {
+        let global = &self.0;
+        if let Err(cause) = wgc::gfx_select!(encoder.id => global.command_encoder_copy_texture_to_texture(
+            encoder.id,
+            &map_texture_copy_view(source),
+            &map_texture_copy_view(destination),
+            &copy_size
+        )) {
+            self.handle_error_nolabel(
+                &encoder.error_sink,
+                cause,
+                "CommandEncoder::copy_swap_chain_texture_to_texture",
+            );
+        }
+    }
+
+    fn command_encoder_copy_texture_to_swap_chain_texture(
+        &self,
+        encoder: &Self::CommandEncoderId,
+        source: crate::ImageCopyTexture,
+        destination: crate::ImageCopySwapChainTexture,
+        copy_size: wgt::Extent3d,
+    ) {
+        let global = &self.0;
+        if let Err(cause) = wgc::gfx_select!(encoder.id => global.command_encoder_copy_texture_to_texture(
+            encoder.id,
+            &map_texture_copy_view(source),
+            &map_texture_copy_view(destination),
+            &copy_size
+        )) {
+            self.handle_error_nolabel(
+                &encoder.error_sink,
+                cause,
+                "CommandEncoder::copy_texture_to_swap_chain_texture",
+            );
+        }
+    }
+
     fn command_encoder_write_timestamp(
         &self,
         encoder: &Self::CommandEncoderId,

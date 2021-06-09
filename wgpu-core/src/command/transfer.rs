@@ -9,9 +9,9 @@ use crate::{
     conv,
     device::{all_buffer_stages, all_image_stages},
     hub::{GfxBackend, Global, GlobalIdentityHandlerFactory, Storage, Token},
-    id::{BufferId, CommandEncoderId, TextureId},
+    id::{BufferId, CommandEncoderId, TextureId, TextureViewId},
     memory_init_tracker::{MemoryInitKind, MemoryInitTrackerAction},
-    resource::{BufferUse, Texture, TextureErrorDimension, TextureUse},
+    resource::{BufferUse, Texture, TextureView, TextureErrorDimension, TextureUse},
     track::TextureSelector,
 };
 
@@ -25,6 +25,7 @@ pub(crate) const BITS_PER_BYTE: u32 = 8;
 
 pub type ImageCopyBuffer = wgt::ImageCopyBuffer<BufferId>;
 pub type ImageCopyTexture = wgt::ImageCopyTexture<TextureId>;
+pub type ImageCopySwapChainTexture = wgt::ImageCopyTexture<TextureViewId>;
 
 #[derive(Clone, Debug)]
 pub enum CopySide {
@@ -39,6 +40,8 @@ pub enum TransferError {
     InvalidBuffer(BufferId),
     #[error("texture {0:?} is invalid or destroyed")]
     InvalidTexture(TextureId),
+    #[error("texture view {0:?} is invalid or destroyed")]
+    InvalidTextureView(TextureViewId),
     #[error("Source and destination cannot be the same buffer")]
     SameSourceDestinationBuffer,
     #[error("source buffer/texture is missing the `COPY_SRC` usage flag")]
@@ -129,6 +132,55 @@ pub(crate) fn texture_copy_view_to_hal<B: hal::Backend>(
             0,
         ),
         wgt::TextureDimension::D3 => (0, 1, view.origin.z as i32),
+    };
+
+    // TODO: Can't satisfy clippy here unless we modify
+    // `TextureSelector` to use `std::ops::RangeBounds`.
+    #[allow(clippy::range_plus_one)]
+    Ok((
+        hal::image::SubresourceLayers {
+            aspects: texture.aspects,
+            level,
+            layers: layer..layer + layer_count,
+        },
+        TextureSelector {
+            levels: level..level + 1,
+            layers: layer..layer + layer_count,
+        },
+        hal::image::Offset {
+            x: view.origin.x as i32,
+            y: view.origin.y as i32,
+            z,
+        },
+    ))
+}
+
+//TODO: we currently access each texture view twice for a transfer,
+// once only to get the aspect flags, which is unfortunate.
+pub(crate) fn texture_view_copy_view_to_hal<B: hal::Backend>(
+    view: &ImageCopySwapChainTexture,
+    size: &Extent3d,
+    texture_view_guard: &Storage<TextureView<B>, TextureViewId>,
+) -> Result<
+    (
+        hal::image::SubresourceLayers,
+        TextureSelector,
+        hal::image::Offset,
+    ),
+    TransferError,
+> {
+    let texture = texture_view_guard
+        .get(view.texture)
+        .map_err(|_| TransferError::InvalidTextureView(view.texture))?;
+
+    let level = view.mip_level as hal::image::Level;
+    let (layer, layer_count, z) = match texture.dimension {
+        wgt::TextureViewDimension::D1 | wgt::TextureViewDimension::D2 => (
+            view.origin.z as hal::image::Layer,
+            size.depth_or_array_layers as hal::image::Layer,
+            0,
+        ),
+        wgt::TextureViewDimension::D3 => (0, 1, view.origin.z as i32),
     };
 
     // TODO: Can't satisfy clippy here unless we modify
@@ -776,6 +828,282 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         copy_size: &Extent3d,
     ) -> Result<(), CopyError> {
         profiling::scope!("copy_texture_to_texture", "CommandEncoder");
+
+        let hub = B::hub(self);
+        let mut token = Token::root();
+
+        let (mut cmd_buf_guard, mut token) = hub.command_buffers.write(&mut token);
+        let cmd_buf = CommandBuffer::get_encoder_mut(&mut *cmd_buf_guard, command_encoder_id)?;
+        let (_, mut token) = hub.buffers.read(&mut token); // skip token
+        let (texture_guard, _) = hub.textures.read(&mut token);
+        let (src_layers, src_selector, src_offset) =
+            texture_copy_view_to_hal(source, copy_size, &*texture_guard)?;
+        let (dst_layers, dst_selector, dst_offset) =
+            texture_copy_view_to_hal(destination, copy_size, &*texture_guard)?;
+        if src_layers.aspects != dst_layers.aspects {
+            return Err(TransferError::MismatchedAspects.into());
+        }
+
+        #[cfg(feature = "trace")]
+        if let Some(ref mut list) = cmd_buf.commands {
+            list.push(TraceCommand::CopyTextureToTexture {
+                src: source.clone(),
+                dst: destination.clone(),
+                size: *copy_size,
+            });
+        }
+
+        if copy_size.width == 0 || copy_size.height == 0 || copy_size.depth_or_array_layers == 0 {
+            log::trace!("Ignoring copy_texture_to_texture of size 0");
+            return Ok(());
+        }
+
+        let (src_texture, src_pending) = cmd_buf
+            .trackers
+            .textures
+            .use_replace(
+                &*texture_guard,
+                source.texture,
+                src_selector,
+                TextureUse::COPY_SRC,
+            )
+            .unwrap();
+        let &(ref src_raw, _) = src_texture
+            .raw
+            .as_ref()
+            .ok_or(TransferError::InvalidTexture(source.texture))?;
+        if !src_texture.usage.contains(TextureUsage::COPY_SRC) {
+            return Err(TransferError::MissingCopySrcUsageFlag.into());
+        }
+        //TODO: try to avoid this the collection. It's needed because both
+        // `src_pending` and `dst_pending` try to hold `trackers.textures` mutably.
+        let mut barriers = src_pending
+            .map(|pending| pending.into_hal(src_texture))
+            .collect::<Vec<_>>();
+
+        let (dst_texture, dst_pending) = cmd_buf
+            .trackers
+            .textures
+            .use_replace(
+                &*texture_guard,
+                destination.texture,
+                dst_selector,
+                TextureUse::COPY_DST,
+            )
+            .unwrap();
+        let &(ref dst_raw, _) = dst_texture
+            .raw
+            .as_ref()
+            .ok_or(TransferError::InvalidTexture(destination.texture))?;
+        if !dst_texture.usage.contains(TextureUsage::COPY_DST) {
+            return Err(
+                TransferError::MissingCopyDstUsageFlag(None, Some(destination.texture)).into(),
+            );
+        }
+        barriers.extend(dst_pending.map(|pending| pending.into_hal(dst_texture)));
+
+        validate_texture_copy_range(
+            source,
+            src_texture.format,
+            src_texture.kind,
+            CopySide::Source,
+            copy_size,
+        )?;
+        validate_texture_copy_range(
+            destination,
+            dst_texture.format,
+            dst_texture.kind,
+            CopySide::Destination,
+            copy_size,
+        )?;
+
+        // WebGPU uses the physical size of the texture for copies whereas vulkan uses
+        // the virtual size. We have passed validation, so it's safe to use the
+        // image extent data directly. We want the provided copy size to be no larger than
+        // the virtual size.
+        let max_src_image_extent = src_texture.kind.level_extent(source.mip_level as _);
+        let max_dst_image_extent = dst_texture.kind.level_extent(destination.mip_level as _);
+        let image_extent = Extent3d {
+            width: copy_size
+                .width
+                .min(max_src_image_extent.width.min(max_dst_image_extent.width)),
+            height: copy_size
+                .height
+                .min(max_src_image_extent.height.min(max_dst_image_extent.height)),
+            depth_or_array_layers: copy_size.depth_or_array_layers,
+        };
+
+        let region = hal::command::ImageCopy {
+            src_subresource: src_layers,
+            src_offset,
+            dst_subresource: dst_layers,
+            dst_offset,
+            extent: conv::map_extent(&image_extent, src_texture.dimension),
+        };
+        let cmd_buf_raw = cmd_buf.raw.last_mut().unwrap();
+        unsafe {
+            cmd_buf_raw.pipeline_barrier(
+                all_image_stages()..hal::pso::PipelineStage::TRANSFER,
+                hal::memory::Dependencies::empty(),
+                barriers.into_iter(),
+            );
+            cmd_buf_raw.copy_image(
+                src_raw,
+                hal::image::Layout::TransferSrcOptimal,
+                dst_raw,
+                hal::image::Layout::TransferDstOptimal,
+                iter::once(region),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn command_encoder_copy_swap_chain_texture_to_texture<B: GfxBackend>(
+        &self,
+        command_encoder_id: CommandEncoderId,
+        source: &ImageCopySwapChainTexture,
+        destination: &ImageCopyTexture,
+        copy_size: &Extent3d,
+    ) -> Result<(), CopyError> {
+        profiling::scope!("copy_swap_chain_texture_to_texture", "CommandEncoder");
+
+        let hub = B::hub(self);
+        let mut token = Token::root();
+
+        let (mut cmd_buf_guard, mut token) = hub.command_buffers.write(&mut token);
+        let cmd_buf = CommandBuffer::get_encoder_mut(&mut *cmd_buf_guard, command_encoder_id)?;
+        let (_, mut token) = hub.buffers.read(&mut token); // skip token
+        let (texture_guard, _) = hub.texture_views.read(&mut token);
+        let (src_layers, src_selector, src_offset) =
+            texture_view_copy_view_to_hal(source, copy_size, &*texture_guard)?;
+        let (dst_layers, dst_selector, dst_offset) =
+            texture_view_copy_view_to_hal(destination, copy_size, &*texture_guard)?;
+        if src_layers.aspects != dst_layers.aspects {
+            return Err(TransferError::MismatchedAspects.into());
+        }
+
+        #[cfg(feature = "trace")]
+        if let Some(ref mut list) = cmd_buf.commands {
+            list.push(TraceCommand::CopyTextureToTexture {
+                src: source.clone(),
+                dst: destination.clone(),
+                size: *copy_size,
+            });
+        }
+
+        if copy_size.width == 0 || copy_size.height == 0 || copy_size.depth_or_array_layers == 0 {
+            log::trace!("Ignoring copy_texture_to_texture of size 0");
+            return Ok(());
+        }
+
+        let (src_texture, src_pending) = cmd_buf
+            .trackers
+            .textures
+            .use_replace(
+                &*texture_guard,
+                source.texture,
+                src_selector,
+                TextureUse::COPY_SRC,
+            )
+            .unwrap();
+        let &(ref src_raw, _) = src_texture
+            .raw
+            .as_ref()
+            .ok_or(TransferError::InvalidTexture(source.texture))?;
+        if !src_texture.usage.contains(TextureUsage::COPY_SRC) {
+            return Err(TransferError::MissingCopySrcUsageFlag.into());
+        }
+        //TODO: try to avoid this the collection. It's needed because both
+        // `src_pending` and `dst_pending` try to hold `trackers.textures` mutably.
+        let mut barriers = src_pending
+            .map(|pending| pending.into_hal(src_texture))
+            .collect::<Vec<_>>();
+
+        let (dst_texture, dst_pending) = cmd_buf
+            .trackers
+            .textures
+            .use_replace(
+                &*texture_guard,
+                destination.texture,
+                dst_selector,
+                TextureUse::COPY_DST,
+            )
+            .unwrap();
+        let &(ref dst_raw, _) = dst_texture
+            .raw
+            .as_ref()
+            .ok_or(TransferError::InvalidTexture(destination.texture))?;
+        if !dst_texture.usage.contains(TextureUsage::COPY_DST) {
+            return Err(
+                TransferError::MissingCopyDstUsageFlag(None, Some(destination.texture)).into(),
+            );
+        }
+        barriers.extend(dst_pending.map(|pending| pending.into_hal(dst_texture)));
+
+        validate_texture_copy_range(
+            source,
+            src_texture.format,
+            src_texture.kind,
+            CopySide::Source,
+            copy_size,
+        )?;
+        validate_texture_copy_range(
+            destination,
+            dst_texture.format,
+            dst_texture.kind,
+            CopySide::Destination,
+            copy_size,
+        )?;
+
+        // WebGPU uses the physical size of the texture for copies whereas vulkan uses
+        // the virtual size. We have passed validation, so it's safe to use the
+        // image extent data directly. We want the provided copy size to be no larger than
+        // the virtual size.
+        let max_src_image_extent = src_texture.kind.level_extent(source.mip_level as _);
+        let max_dst_image_extent = dst_texture.kind.level_extent(destination.mip_level as _);
+        let image_extent = Extent3d {
+            width: copy_size
+                .width
+                .min(max_src_image_extent.width.min(max_dst_image_extent.width)),
+            height: copy_size
+                .height
+                .min(max_src_image_extent.height.min(max_dst_image_extent.height)),
+            depth_or_array_layers: copy_size.depth_or_array_layers,
+        };
+
+        let region = hal::command::ImageCopy {
+            src_subresource: src_layers,
+            src_offset,
+            dst_subresource: dst_layers,
+            dst_offset,
+            extent: conv::map_extent(&image_extent, src_texture.dimension),
+        };
+        let cmd_buf_raw = cmd_buf.raw.last_mut().unwrap();
+        unsafe {
+            cmd_buf_raw.pipeline_barrier(
+                all_image_stages()..hal::pso::PipelineStage::TRANSFER,
+                hal::memory::Dependencies::empty(),
+                barriers.into_iter(),
+            );
+            cmd_buf_raw.copy_image(
+                src_raw,
+                hal::image::Layout::TransferSrcOptimal,
+                dst_raw,
+                hal::image::Layout::TransferDstOptimal,
+                iter::once(region),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn command_encoder_copy_texture_to_swap_chain_texture<B: GfxBackend>(
+        &self,
+        command_encoder_id: CommandEncoderId,
+        source: &ImageCopyTexture,
+        destination: &ImageCopySwapChainTexture,
+        copy_size: &Extent3d,
+    ) -> Result<(), CopyError> {
+        profiling::scope!("copy_texture_to_swap_chain_texture", "CommandEncoder");
 
         let hub = B::hub(self);
         let mut token = Token::root();
