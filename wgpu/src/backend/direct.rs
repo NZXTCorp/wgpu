@@ -543,6 +543,14 @@ fn map_texture_copy_view(view: crate::ImageCopyTexture) -> wgc::command::ImageCo
     }
 }
 
+fn map_texture_view_copy_view(view: crate::ImageCopySwapChainTexture) -> wgc::command::ImageCopySwapChainTexture {
+    wgc::command::ImageCopySwapChainTexture {
+        texture: view.texture.view.id,
+        mip_level: view.mip_level,
+        origin: view.origin,
+    }
+}
+
 fn map_pass_channel<V: Copy + Default>(
     ops: Option<&Operations<V>>,
 ) -> wgc::command::PassChannel<V> {
@@ -1647,9 +1655,9 @@ impl crate::Context for Context {
         copy_size: wgt::Extent3d,
     ) {
         let global = &self.0;
-        if let Err(cause) = wgc::gfx_select!(encoder.id => global.command_encoder_copy_texture_to_texture(
+        if let Err(cause) = wgc::gfx_select!(encoder.id => global.command_encoder_copy_swap_chain_texture_to_texture(
             encoder.id,
-            &map_texture_copy_view(source),
+            &map_texture_view_copy_view(source),
             &map_texture_copy_view(destination),
             &copy_size
         )) {
@@ -1669,10 +1677,10 @@ impl crate::Context for Context {
         copy_size: wgt::Extent3d,
     ) {
         let global = &self.0;
-        if let Err(cause) = wgc::gfx_select!(encoder.id => global.command_encoder_copy_texture_to_texture(
+        if let Err(cause) = wgc::gfx_select!(encoder.id => global.command_encoder_copy_texture_to_swap_chain_texture(
             encoder.id,
             &map_texture_copy_view(source),
-            &map_texture_copy_view(destination),
+            &map_texture_view_copy_view(destination),
             &copy_size
         )) {
             self.handle_error_nolabel(

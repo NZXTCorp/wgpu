@@ -48,6 +48,8 @@ pub enum TransferError {
     MissingCopySrcUsageFlag,
     #[error("destination buffer/texture is missing the `COPY_DST` usage flag")]
     MissingCopyDstUsageFlag(Option<BufferId>, Option<TextureId>),
+    #[error("destination TextureView is missing the `COPY_DST` usage flag")]
+    MissingCopyTextureViewDstUsageFlag(Option<BufferId>, Option<TextureViewId>),
     #[error("copy of {start_offset}..{end_offset} would end up overrunning the bounds of the {side:?} buffer of size {buffer_size}")]
     BufferOverrun {
         start_offset: BufferAddress,
@@ -175,7 +177,7 @@ pub(crate) fn texture_view_copy_view_to_hal<B: hal::Backend>(
 
     let level = view.mip_level as hal::image::Level;
     let (layer, layer_count, z) = match texture.dimension {
-        wgt::TextureViewDimension::D1 | wgt::TextureViewDimension::D2 => (
+        wgt::TextureViewDimension::D1 | wgt::TextureViewDimension::D2 | wgt::TextureViewDimension::D2Array | wgt::TextureViewDimension::Cube | wgt::TextureViewDimension::CubeArray => (
             view.origin.z as hal::image::Layer,
             size.depth_or_array_layers as hal::image::Layer,
             0,
@@ -298,9 +300,43 @@ pub(crate) fn validate_linear_texture_data(
     Ok(required_bytes_in_copy)
 }
 
-/// Function copied with minor modifications from webgpu standard <https://gpuweb.github.io/gpuweb/#valid-texture-copy-range>
 pub(crate) fn validate_texture_copy_range(
     texture_copy_view: &ImageCopyTexture,
+    texture_format: wgt::TextureFormat,
+    texture_dimension: hal::image::Kind,
+    texture_side: CopySide,
+    copy_size: &Extent3d,
+) -> Result<(), TransferError> {
+    validate_texture_copy_range_internal(&texture_copy_view.origin, texture_copy_view.mip_level, texture_format,texture_dimension, texture_side, copy_size )
+}
+
+pub(crate) fn validate_texture_view_copy_range(
+    texture_copy_view: &ImageCopySwapChainTexture,
+    texture_format: wgt::TextureFormat,
+    texture_dimension: wgt::TextureViewDimension,
+    texture_extent: Extent3d,
+    texture_samples: hal::image::NumSamples,
+    texture_side: CopySide,
+    copy_size: &Extent3d,
+) -> Result<(), TransferError> {
+    let texture_dimension = map_view_info_to_hal_kind(texture_dimension, texture_extent, texture_samples);
+    validate_texture_copy_range_internal(&texture_copy_view.origin, texture_copy_view.mip_level, texture_format, texture_dimension, texture_side, copy_size )
+}
+
+pub(crate) fn map_view_info_to_hal_kind(texture_dimension: wgt::TextureViewDimension,
+                                        texture_extent: Extent3d,
+                                        texture_samples: hal::image::NumSamples) -> hal::image::Kind {
+    match texture_dimension {
+        wgt::TextureViewDimension::D1 => hal::image::Kind::D1(texture_extent.width, texture_extent.depth_or_array_layers as u16),
+        wgt::TextureViewDimension::D2 | wgt::TextureViewDimension::D2Array | wgt::TextureViewDimension::Cube | wgt::TextureViewDimension::CubeArray => hal::image::Kind::D2(texture_extent.width, texture_extent.height, texture_extent.depth_or_array_layers as u16, texture_samples),
+        wgt::TextureViewDimension::D3 => hal::image::Kind::D3(texture_extent.width, texture_extent.height, texture_extent.depth_or_array_layers),
+    }
+}
+
+/// Function copied with minor modifications from webgpu standard <https://gpuweb.github.io/gpuweb/#valid-texture-copy-range>
+pub(crate) fn validate_texture_copy_range_internal(
+    texture_origin: &wgt::Origin3d,
+    texture_mip_level: u32,
     texture_format: wgt::TextureFormat,
     texture_dimension: hal::image::Kind,
     texture_side: CopySide,
@@ -310,10 +346,10 @@ pub(crate) fn validate_texture_copy_range(
     let block_width = block_width as u32;
     let block_height = block_height as u32;
 
-    let mut extent = texture_dimension.level_extent(texture_copy_view.mip_level as u8);
+    let mut extent = texture_dimension.level_extent(texture_mip_level as u8);
 
     // Adjust extent for the physical size of mips
-    if texture_copy_view.mip_level != 0 {
+    if texture_mip_level != 0 {
         extent.width = conv::align_up(extent.width, block_width);
         extent.height = conv::align_up(extent.height, block_height);
     }
@@ -330,30 +366,30 @@ pub(crate) fn validate_texture_copy_range(
         hal::image::Kind::D3(..) => {}
     };
 
-    let x_copy_max = texture_copy_view.origin.x + copy_size.width;
+    let x_copy_max = texture_origin.x + copy_size.width;
     if x_copy_max > extent.width {
         return Err(TransferError::TextureOverrun {
-            start_offset: texture_copy_view.origin.x,
+            start_offset: texture_origin.x,
             end_offset: x_copy_max,
             texture_size: extent.width,
             dimension: TextureErrorDimension::X,
             side: texture_side,
         });
     }
-    let y_copy_max = texture_copy_view.origin.y + copy_size.height;
+    let y_copy_max = texture_origin.y + copy_size.height;
     if y_copy_max > extent.height {
         return Err(TransferError::TextureOverrun {
-            start_offset: texture_copy_view.origin.y,
+            start_offset: texture_origin.y,
             end_offset: y_copy_max,
             texture_size: extent.height,
             dimension: TextureErrorDimension::Y,
             side: texture_side,
         });
     }
-    let z_copy_max = texture_copy_view.origin.z + copy_size.depth_or_array_layers;
+    let z_copy_max = texture_origin.z + copy_size.depth_or_array_layers;
     if z_copy_max > extent.depth {
         return Err(TransferError::TextureOverrun {
-            start_offset: texture_copy_view.origin.z,
+            start_offset: texture_origin.z,
             end_offset: z_copy_max,
             texture_size: extent.depth,
             dimension: TextureErrorDimension::Z,
@@ -361,10 +397,10 @@ pub(crate) fn validate_texture_copy_range(
         });
     }
 
-    if texture_copy_view.origin.x % block_width != 0 {
+    if texture_origin.x % block_width != 0 {
         return Err(TransferError::UnalignedCopyOriginX);
     }
-    if texture_copy_view.origin.y % block_height != 0 {
+    if texture_origin.y % block_height != 0 {
         return Err(TransferError::UnalignedCopyOriginY);
     }
     if copy_size.width % block_width != 0 {
@@ -972,19 +1008,21 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
 
         let (mut cmd_buf_guard, mut token) = hub.command_buffers.write(&mut token);
         let cmd_buf = CommandBuffer::get_encoder_mut(&mut *cmd_buf_guard, command_encoder_id)?;
-        let (_, mut token) = hub.buffers.read(&mut token); // skip token
-        let (texture_guard, _) = hub.texture_views.read(&mut token);
-        let (src_layers, src_selector, src_offset) =
-            texture_view_copy_view_to_hal(source, copy_size, &*texture_guard)?;
+        let (_, mut token) = hub.buffers.read(&mut token);
+
+        let (texture_guard, mut token) = hub.textures.read(&mut token);
+        let (texture_view_guard, _) = hub.texture_views.read(&mut token);
+        let (src_layers, _, src_offset) =
+            texture_view_copy_view_to_hal(source, copy_size, &*texture_view_guard)?;
         let (dst_layers, dst_selector, dst_offset) =
-            texture_view_copy_view_to_hal(destination, copy_size, &*texture_guard)?;
+            texture_copy_view_to_hal(destination, copy_size, &*texture_guard)?;
         if src_layers.aspects != dst_layers.aspects {
             return Err(TransferError::MismatchedAspects.into());
         }
 
         #[cfg(feature = "trace")]
         if let Some(ref mut list) = cmd_buf.commands {
-            list.push(TraceCommand::CopyTextureToTexture {
+            list.push(TraceCommand::CopySwapChainTextureToTexture {
                 src: source.clone(),
                 dst: destination.clone(),
                 size: *copy_size,
@@ -996,28 +1034,22 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
             return Ok(());
         }
 
-        let (src_texture, src_pending) = cmd_buf
+        let (src_texture, _) = cmd_buf
             .trackers
-            .textures
+            .views
             .use_replace(
-                &*texture_guard,
+                &*texture_view_guard,
                 source.texture,
-                src_selector,
-                TextureUse::COPY_SRC,
+                (),
+                (),
             )
             .unwrap();
-        let &(ref src_raw, _) = src_texture
-            .raw
-            .as_ref()
-            .ok_or(TransferError::InvalidTexture(source.texture))?;
-        if !src_texture.usage.contains(TextureUsage::COPY_SRC) {
+        let src_raw = src_texture
+            .get_swapchain_image()
+            .ok_or(TransferError::InvalidTextureView(source.texture))?;
+        if !src_texture.format_features.allowed_usages.contains(TextureUsage::COPY_SRC) {
             return Err(TransferError::MissingCopySrcUsageFlag.into());
         }
-        //TODO: try to avoid this the collection. It's needed because both
-        // `src_pending` and `dst_pending` try to hold `trackers.textures` mutably.
-        let mut barriers = src_pending
-            .map(|pending| pending.into_hal(src_texture))
-            .collect::<Vec<_>>();
 
         let (dst_texture, dst_pending) = cmd_buf
             .trackers
@@ -1038,12 +1070,14 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                 TransferError::MissingCopyDstUsageFlag(None, Some(destination.texture)).into(),
             );
         }
-        barriers.extend(dst_pending.map(|pending| pending.into_hal(dst_texture)));
+        let barriers = dst_pending.map(|pending| pending.into_hal(dst_texture));
 
-        validate_texture_copy_range(
+        validate_texture_view_copy_range(
             source,
             src_texture.format,
-            src_texture.kind,
+            src_texture.dimension,
+            src_texture.extent,
+            src_texture.samples,
             CopySide::Source,
             copy_size,
         )?;
@@ -1059,7 +1093,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         // the virtual size. We have passed validation, so it's safe to use the
         // image extent data directly. We want the provided copy size to be no larger than
         // the virtual size.
-        let max_src_image_extent = src_texture.kind.level_extent(source.mip_level as _);
+        let max_src_image_extent = map_view_info_to_hal_kind(src_texture.dimension, src_texture.extent, src_texture.samples).level_extent(source.mip_level as _);
         let max_dst_image_extent = dst_texture.kind.level_extent(destination.mip_level as _);
         let image_extent = Extent3d {
             width: copy_size
@@ -1076,7 +1110,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
             src_offset,
             dst_subresource: dst_layers,
             dst_offset,
-            extent: conv::map_extent(&image_extent, src_texture.dimension),
+            extent: conv::map_texture_view_extent(&image_extent, src_texture.dimension),
         };
         let cmd_buf_raw = cmd_buf.raw.last_mut().unwrap();
         unsafe {
@@ -1110,19 +1144,21 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
 
         let (mut cmd_buf_guard, mut token) = hub.command_buffers.write(&mut token);
         let cmd_buf = CommandBuffer::get_encoder_mut(&mut *cmd_buf_guard, command_encoder_id)?;
-        let (_, mut token) = hub.buffers.read(&mut token); // skip token
-        let (texture_guard, _) = hub.textures.read(&mut token);
+        let (_, mut token) = hub.buffers.read(&mut token);
+
+        let (texture_guard, mut token) = hub.textures.read(&mut token);
+        let (texture_view_guard, _) = hub.texture_views.read(&mut token);
         let (src_layers, src_selector, src_offset) =
             texture_copy_view_to_hal(source, copy_size, &*texture_guard)?;
-        let (dst_layers, dst_selector, dst_offset) =
-            texture_copy_view_to_hal(destination, copy_size, &*texture_guard)?;
+        let (dst_layers, _, dst_offset) =
+            texture_view_copy_view_to_hal(destination, copy_size, &*texture_view_guard)?;
         if src_layers.aspects != dst_layers.aspects {
             return Err(TransferError::MismatchedAspects.into());
         }
 
         #[cfg(feature = "trace")]
         if let Some(ref mut list) = cmd_buf.commands {
-            list.push(TraceCommand::CopyTextureToTexture {
+            list.push(TraceCommand::CopyTextureToSwapChainTexture {
                 src: source.clone(),
                 dst: destination.clone(),
                 size: *copy_size,
@@ -1151,32 +1187,27 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         if !src_texture.usage.contains(TextureUsage::COPY_SRC) {
             return Err(TransferError::MissingCopySrcUsageFlag.into());
         }
-        //TODO: try to avoid this the collection. It's needed because both
-        // `src_pending` and `dst_pending` try to hold `trackers.textures` mutably.
-        let mut barriers = src_pending
-            .map(|pending| pending.into_hal(src_texture))
-            .collect::<Vec<_>>();
+        let barriers = src_pending
+            .map(|pending| pending.into_hal(src_texture));
 
-        let (dst_texture, dst_pending) = cmd_buf
+        let (dst_texture, _) = cmd_buf
             .trackers
-            .textures
+            .views
             .use_replace(
-                &*texture_guard,
+                &*texture_view_guard,
                 destination.texture,
-                dst_selector,
-                TextureUse::COPY_DST,
+                (),
+                (),
             )
             .unwrap();
-        let &(ref dst_raw, _) = dst_texture
-            .raw
-            .as_ref()
-            .ok_or(TransferError::InvalidTexture(destination.texture))?;
-        if !dst_texture.usage.contains(TextureUsage::COPY_DST) {
+        let dst_raw = dst_texture
+            .get_swapchain_image()
+            .ok_or(TransferError::InvalidTextureView(destination.texture))?;
+        if !dst_texture.format_features.allowed_usages.contains(TextureUsage::COPY_DST) {
             return Err(
-                TransferError::MissingCopyDstUsageFlag(None, Some(destination.texture)).into(),
+                TransferError::MissingCopyTextureViewDstUsageFlag(None, Some(destination.texture)).into(),
             );
         }
-        barriers.extend(dst_pending.map(|pending| pending.into_hal(dst_texture)));
 
         validate_texture_copy_range(
             source,
@@ -1185,10 +1216,12 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
             CopySide::Source,
             copy_size,
         )?;
-        validate_texture_copy_range(
+        validate_texture_view_copy_range(
             destination,
             dst_texture.format,
-            dst_texture.kind,
+            dst_texture.dimension,
+            dst_texture.extent,
+            dst_texture.samples,
             CopySide::Destination,
             copy_size,
         )?;
@@ -1198,7 +1231,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         // image extent data directly. We want the provided copy size to be no larger than
         // the virtual size.
         let max_src_image_extent = src_texture.kind.level_extent(source.mip_level as _);
-        let max_dst_image_extent = dst_texture.kind.level_extent(destination.mip_level as _);
+        let max_dst_image_extent = map_view_info_to_hal_kind(dst_texture.dimension, dst_texture.extent, dst_texture.samples).level_extent(destination.mip_level as _);
         let image_extent = Extent3d {
             width: copy_size
                 .width

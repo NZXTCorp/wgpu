@@ -142,6 +142,16 @@ pub enum Command {
         dst: crate::command::ImageCopyTexture,
         size: wgt::Extent3d,
     },
+    CopySwapChainTextureToTexture {
+        src: crate::command::ImageCopySwapChainTexture,
+        dst: crate::command::ImageCopyTexture,
+        size: wgt::Extent3d,
+    },
+    CopyTextureToSwapChainTexture {
+        src: crate::command::ImageCopyTexture,
+        dst: crate::command::ImageCopySwapChainTexture,
+        size: wgt::Extent3d,
+    },
     ClearBuffer {
         dst: id::BufferId,
         offset: wgt::BufferAddress,

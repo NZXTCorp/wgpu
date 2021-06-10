@@ -185,6 +185,17 @@ pub fn map_extent(extent: &wgt::Extent3d, dim: wgt::TextureDimension) -> hal::im
     }
 }
 
+pub fn map_texture_view_extent(extent: &wgt::Extent3d, dim: wgt::TextureViewDimension) -> hal::image::Extent {
+    hal::image::Extent {
+        width: extent.width,
+        height: extent.height,
+        depth: match dim {
+            wgt::TextureViewDimension::D1 | wgt::TextureViewDimension::D2 | wgt::TextureViewDimension::D2Array | wgt::TextureViewDimension::Cube | wgt::TextureViewDimension::CubeArray => 1,
+            wgt::TextureViewDimension::D3 => extent.depth_or_array_layers,
+        },
+    }
+}
+
 pub fn map_primitive_topology(primitive_topology: wgt::PrimitiveTopology) -> hal::pso::Primitive {
     use hal::pso::Primitive as H;
     use wgt::PrimitiveTopology as Pt;
